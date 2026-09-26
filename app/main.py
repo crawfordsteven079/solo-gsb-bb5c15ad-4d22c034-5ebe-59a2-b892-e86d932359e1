@@ -82,11 +82,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reliable Webhook Delivery API",
-    version="1.3.0",
+    version="1.4.0",
     description="Sign, enqueue, reliably deliver, replay and inspect webhook events, "
     "with persistent per-target circuit breakers.",
     lifespan=lifespan,
 )
+
+
+# Maximum number of events accepted by one POST /events/batch call.
+MAX_BATCH_EVENTS = 100
 
 
 @app.post("/events", status_code=201)
@@ -138,6 +142,125 @@ async def create_event(request: Request) -> JSONResponse:
         status_code=201 if created else 200, content=_public_event(full)
     )
     if not created:
+        response.headers["Idempotent-Replay"] = "true"
+    return response
+
+
+@app.post("/events/batch")
+async def create_events_batch(request: Request) -> JSONResponse:
+    """Ingest a batch of 1–100 events atomically.
+
+    The body is a JSON array of event objects identical to ``POST /events``
+    and the signature is verified against the entire raw body, exactly as
+    for single events.
+
+    Semantics per item, in array order:
+
+    - An idempotency key already stored returns the original event with
+      ``created=false``; every other field of that item is ignored, valid
+      or not, and nothing is re-enqueued.
+    - A new key is validated like a single event (target URL, delivery
+      window) and enqueued in array order.
+
+    The batch is all-or-nothing for new events: a duplicate key *within*
+    the batch, an invalid new event or any write failure means no new
+    event of the batch is stored (422/500 and the database is untouched).
+    Re-sending the same batch simply yields ``created=false`` for every
+    item and never delivers anything twice. Responses are 201 when every
+    item was newly created, otherwise 200 with ``Idempotent-Replay: true``.
+    """
+    raw_body = await request.body()
+    signature = request.headers.get(config.SIGNATURE_HEADER)
+    if not _valid_signature(raw_body, signature):
+        raise HTTPException(
+            status_code=401, detail="invalid or missing X-Webhook-Signature"
+        )
+
+    try:
+        data = json.loads(raw_body) if raw_body else None
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="request body must be JSON")
+    if not isinstance(data, list):
+        raise HTTPException(status_code=400, detail="request body must be a JSON array")
+    if not 1 <= len(data) <= MAX_BATCH_EVENTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"batch must contain between 1 and {MAX_BATCH_EVENTS} events",
+        )
+
+    # Every item must at least carry a usable idempotency key — that is all
+    # the stored-event lookup needs. Everything else is validated only for
+    # items that turn out to be new.
+    keys: list[str] = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise HTTPException(
+                status_code=422, detail=f"item {i} must be a JSON object"
+            )
+        key = item.get("idempotency_key")
+        if not isinstance(key, str) or not key:
+            raise HTTPException(
+                status_code=422,
+                detail=f"item {i}: idempotency_key must be a non-empty string",
+            )
+        keys.append(key)
+    seen: dict[str, int] = {}
+    for i, key in enumerate(keys):
+        if key in seen:
+            raise HTTPException(
+                status_code=422,
+                detail=f"duplicate idempotency_key {key!r} in batch "
+                f"(items {seen[key]} and {i})",
+            )
+        seen[key] = i
+
+    existing = {e["idempotency_key"]: e for e in db.get_events_by_keys(keys)}
+
+    plan: list[tuple[str, Any]] = []
+    new_items: list[dict] = []
+    for i, item in enumerate(data):
+        stored = existing.get(item["idempotency_key"])
+        if stored is not None:
+            # Known key: the stored event wins and every other field of
+            # this item is ignored, valid or not.
+            plan.append(("replay", stored))
+            continue
+        try:
+            event_in = EventIn(**item)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422, detail={"index": i, "errors": exc.errors()}
+            )
+        plan.append(("new", len(new_items)))
+        new_items.append(
+            {
+                "idempotency_key": event_in.idempotency_key,
+                "target": str(event_in.target),
+                "payload": event_in.payload,
+                "deliver_after": event_in.deliver_after,
+                "expires_at": event_in.expires_at,
+            }
+        )
+
+    try:
+        created_results = db.create_events_batch(new_items)
+    except db.InvalidDeliveryWindowError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    events_out = []
+    all_created = True
+    for kind, ref in plan:
+        if kind == "replay":
+            event, created = ref, False
+        else:
+            event, created = created_results[ref]
+        all_created = all_created and created
+        full = db.get_event(event["id"])
+        events_out.append({"created": created, "event": _public_event(full)})
+    response = JSONResponse(
+        status_code=201 if all_created else 200, content={"events": events_out}
+    )
+    if not all_created:
         response.headers["Idempotent-Replay"] = "true"
     return response
 

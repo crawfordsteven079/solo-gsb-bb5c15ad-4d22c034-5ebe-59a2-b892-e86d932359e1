@@ -249,6 +249,98 @@ def create_event(
         return dict(row), True
 
 
+def get_events_by_keys(keys: list[str]) -> list[dict]:
+    """Return the stored events for the given idempotency keys (any order)."""
+    if not keys:
+        return []
+    with db_lock:
+        conn = get_conn()
+        placeholders = ", ".join("?" for _ in keys)
+        rows = conn.execute(
+            f"SELECT * FROM events WHERE idempotency_key IN ({placeholders})",
+            tuple(keys),
+        ).fetchall()
+        return [_hydrate(r) for r in rows]
+
+
+def create_events_batch(items: list[dict]) -> list[tuple[dict, bool]]:
+    """Insert a batch of new events in a single SQLite transaction.
+
+    ``items`` carry ``idempotency_key``/``target``/``payload`` plus optional
+    ``deliver_after``/``expires_at`` datetimes (already shape-validated by
+    the API layer). Returns one ``(event, created)`` pair per item, in input
+    order.
+
+    The batch is all-or-nothing: every delivery window is validated before
+    the first INSERT and any failure (invalid window, write error) rolls the
+    transaction back, so a batch never lands partially. A key that already
+    exists when its turn comes yields the stored event with
+    ``created=False`` — re-sending a batch never enqueues anything twice.
+    All events of one batch share a single creation timestamp, and inserts
+    happen in input order so rowid (creation) ordering — which drives the
+    per-endpoint delivery order — matches the caller's array order.
+    """
+    now_dt = datetime.now(timezone.utc)
+    with db_lock:
+        conn = get_conn()
+        try:
+            staged: list[dict] = []
+            for item in items:
+                existing = conn.execute(
+                    "SELECT * FROM events WHERE idempotency_key = ?",
+                    (item["idempotency_key"],),
+                ).fetchone()
+                if existing is not None:
+                    staged.append({"existing": dict(existing)})
+                    continue
+                deliver_after = item["deliver_after"] or now_dt
+                expires_at = item["expires_at"]
+                if expires_at is not None and expires_at <= deliver_after:
+                    raise InvalidDeliveryWindowError(
+                        "expires_at must be later than deliver_after "
+                        f"(idempotency_key={item['idempotency_key']!r}, "
+                        f"deliver_after={_iso_utc(deliver_after)}, "
+                        f"expires_at={_iso_utc(expires_at)})"
+                    )
+                staged.append({"params": (
+                    uuid.uuid4().hex,
+                    item["idempotency_key"],
+                    item["target"],
+                    json.dumps(
+                        item["payload"], separators=(",", ":"), ensure_ascii=False
+                    ),
+                    _iso_utc(now_dt),
+                    deliver_after.timestamp(),
+                    _iso_utc(deliver_after),
+                    _iso_utc(expires_at) if expires_at is not None else None,
+                    expires_at.timestamp() if expires_at is not None else None,
+                )})
+            results: list[tuple[dict, bool]] = []
+            for entry in staged:
+                if "existing" in entry:
+                    results.append((entry["existing"], False))
+                    continue
+                params = entry["params"]
+                conn.execute(
+                    "INSERT INTO events "
+                    "(id, idempotency_key, target, payload, status, attempts_count, "
+                    " created_at, next_attempt_at, deliver_after, expires_at, "
+                    " expires_at_ts) "
+                    "VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)",
+                    params,
+                )
+                row = conn.execute(
+                    "SELECT * FROM events WHERE id = ?", (params[0],)
+                ).fetchone()
+                results.append((dict(row), True))
+            conn.commit()
+            return results
+        except Exception:
+            # Nothing of this batch may survive a failed validation or write.
+            conn.rollback()
+            raise
+
+
 def _hydrate(row: sqlite3.Row) -> dict:
     event = dict(row)
     try:

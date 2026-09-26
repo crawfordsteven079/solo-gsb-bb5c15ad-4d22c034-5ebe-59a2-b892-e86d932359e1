@@ -676,3 +676,260 @@ def test_processing_event_is_not_interrupted_by_expiry(server):
         timeout=10,
     )
     assert final["attempts_count"] == 1
+
+
+# -------------------------------------------------------------- batch ingest
+
+def _post_batch(base_url: str, items, sign: bool = True) -> httpx.Response:
+    body = json.dumps(items).encode()
+    headers = {"Content-Type": "application/json"}
+    if sign:
+        headers["X-Webhook-Signature"] = _sign(body)
+    return httpx.post(f"{base_url}/events/batch", content=body, headers=headers)
+
+
+def _batch_item(base_url: str, key: str | None = None,
+                target_path: str = "/t/record", **extra) -> dict:
+    item = {
+        "idempotency_key": key or uuid.uuid4().hex,
+        "target": f"{base_url}{target_path}",
+        "payload": {"v": 1},
+    }
+    item.update(extra)
+    return item
+
+
+def test_batch_requires_valid_signature(server):
+    items = [_batch_item(server.base_url)]
+    assert _post_batch(server.base_url, items, sign=False).status_code == 401
+    body = json.dumps(items).encode()
+    resp = httpx.post(
+        f"{server.base_url}/events/batch",
+        content=body,
+        headers={"X-Webhook-Signature": "sha256=deadbeef"},
+    )
+    assert resp.status_code == 401
+    # Signature over a different (tampered) body is rejected too.
+    resp = httpx.post(
+        f"{server.base_url}/events/batch",
+        content=body,
+        headers={"X-Webhook-Signature": _sign(body + b" ")},
+    )
+    assert resp.status_code == 401
+
+
+def test_batch_rejects_non_array_and_non_json_body(server):
+    body = b'{"idempotency_key":"x"}'
+    resp = httpx.post(
+        f"{server.base_url}/events/batch",
+        content=body,
+        headers={"X-Webhook-Signature": _sign(body)},
+    )
+    assert resp.status_code == 400
+    body = b"not-json"
+    resp = httpx.post(
+        f"{server.base_url}/events/batch",
+        content=body,
+        headers={"X-Webhook-Signature": _sign(body)},
+    )
+    assert resp.status_code == 400
+
+
+def test_batch_size_limits(server):
+    assert _post_batch(server.base_url, []).status_code == 422
+    too_many = [_batch_item(server.base_url) for _ in range(101)]
+    assert _post_batch(server.base_url, too_many).status_code == 422
+    # The upper bound itself is accepted. A dedicated target URL keeps this
+    # 100-event queue from slowing down the other tests' targets.
+    target_path = f"/dev/sink?sizetest={uuid.uuid4().hex}"
+    exactly = [
+        _batch_item(server.base_url, target_path=target_path) for _ in range(100)
+    ]
+    resp = _post_batch(server.base_url, exactly)
+    assert resp.status_code == 201
+    assert len(resp.json()["events"]) == 100
+
+
+def test_batch_item_shape_errors(server):
+    assert _post_batch(server.base_url, [42]).status_code == 422
+    assert _post_batch(server.base_url, [{"target": "http://x"}]).status_code == 422
+    item = _batch_item(server.base_url)
+    item["idempotency_key"] = ""
+    assert _post_batch(server.base_url, [item]).status_code == 422
+    item = _batch_item(server.base_url)
+    item["idempotency_key"] = 123
+    assert _post_batch(server.base_url, [item]).status_code == 422
+
+
+def test_batch_duplicate_keys_within_batch_rejected(server):
+    key = f"batchdup-{uuid.uuid4().hex}"
+    items = [
+        _batch_item(server.base_url, key=key),
+        _batch_item(server.base_url),
+        _batch_item(server.base_url, key=key),
+    ]
+    resp = _post_batch(server.base_url, items)
+    assert resp.status_code == 422
+    assert key in resp.json()["detail"]
+    # Nothing from the batch was stored.
+    for item in items:
+        assert (
+            httpx.get(
+                f"{server.base_url}/events/key/{item['idempotency_key']}"
+            ).status_code
+            == 404
+        )
+
+
+def test_batch_creates_and_delivers_in_array_order(server):
+    # A dedicated target URL (query strings make distinct targets) gives this
+    # batch its own head-of-queue, so delivery order reflects only this batch.
+    target_path = f"/t/record?ord={uuid.uuid4().hex}"
+    items = [_batch_item(server.base_url, target_path=target_path) for _ in range(3)]
+    resp = _post_batch(server.base_url, items)
+    assert resp.status_code == 201
+    assert "idempotent-replay" not in resp.headers
+    out = resp.json()["events"]
+    assert [e["created"] for e in out] == [True, True, True]
+    ids = [e["event"]["id"] for e in out]
+    assert len(set(ids)) == 3
+    # Response order matches input order (keys echo back in place).
+    assert [e["event"]["idempotency_key"] for e in out] == [
+        i["idempotency_key"] for i in items
+    ]
+
+    for event_id in ids:
+        wait_for(lambda: _get_event(server.base_url, event_id)["status"] == "delivered")
+    # Same target => strict head-of-queue order: deliveries follow array order.
+    mine = [r for r in receipts if r["event_id"] in ids]
+    assert [r["event_id"] for r in mine] == ids
+
+
+def test_batch_existing_key_returns_original_and_ignores_other_fields(server):
+    key_a = f"batch-existing-{uuid.uuid4().hex}"
+    first = _post_event(server.base_url, "/t/record", key=key_a)
+    assert first.status_code == 201
+    original = first.json()
+
+    now = datetime.now(timezone.utc)
+    dup = {
+        "idempotency_key": key_a,
+        "target": f"{server.base_url}/t/record",
+        "payload": {"changed": True},
+        # Even an invalid window on a known key is ignored entirely.
+        "deliver_after": (now + timedelta(seconds=10)).isoformat(),
+        "expires_at": (now + timedelta(seconds=5)).isoformat(),
+    }
+    new_item = _batch_item(server.base_url)
+    resp = _post_batch(server.base_url, [dup, new_item])
+    assert resp.status_code == 200
+    assert resp.headers.get("idempotent-replay") == "true"
+    out = resp.json()["events"]
+    assert out[0]["created"] is False
+    assert out[0]["event"]["id"] == original["id"]
+    assert out[0]["event"]["payload"] == original["payload"]
+    assert out[0]["event"]["expires_at"] is None
+    assert out[1]["created"] is True
+
+    wait_for(lambda: _get_event(server.base_url, original["id"])["status"] == "delivered")
+    wait_for(
+        lambda: _get_event(server.base_url, out[1]["event"]["id"])["status"]
+        == "delivered"
+    )
+    # The duplicate item did not trigger a second delivery of the original.
+    mine = [r for r in receipts if r["idempotency_key"] == key_a]
+    assert len(mine) == 1
+
+
+def test_batch_invalid_new_event_rolls_back_whole_batch(server):
+    good_1 = _batch_item(server.base_url)
+    bad_target = _batch_item(server.base_url, target_path="/t/record")
+    bad_target["target"] = "not-a-url"
+    good_2 = _batch_item(server.base_url)
+    resp = _post_batch(server.base_url, [good_1, bad_target, good_2])
+    assert resp.status_code == 422
+    # No new event of the batch was stored, including the valid ones.
+    for item in (good_1, good_2):
+        assert (
+            httpx.get(
+                f"{server.base_url}/events/key/{item['idempotency_key']}"
+            ).status_code
+            == 404
+        )
+
+    # Same all-or-nothing rule when the delivery window is invalid.
+    now = datetime.now(timezone.utc)
+    good_3 = _batch_item(server.base_url)
+    bad_window = _batch_item(
+        server.base_url,
+        deliver_after=(now + timedelta(seconds=10)).isoformat(),
+        expires_at=(now + timedelta(seconds=5)).isoformat(),
+    )
+    resp = _post_batch(server.base_url, [good_3, bad_window])
+    assert resp.status_code == 422
+    assert (
+        httpx.get(
+            f"{server.base_url}/events/key/{good_3['idempotency_key']}"
+        ).status_code
+        == 404
+    )
+
+
+def test_batch_resend_never_delivers_twice(server):
+    items = [_batch_item(server.base_url) for _ in range(2)]
+    first = _post_batch(server.base_url, items)
+    assert first.status_code == 201
+    ids = [e["event"]["id"] for e in first.json()["events"]]
+    for event_id in ids:
+        wait_for(lambda: _get_event(server.base_url, event_id)["status"] == "delivered")
+
+    second = _post_batch(server.base_url, items)
+    assert second.status_code == 200
+    assert second.headers.get("idempotent-replay") == "true"
+    out = second.json()["events"]
+    assert [e["created"] for e in out] == [False, False]
+    assert [e["event"]["id"] for e in out] == ids
+
+    time.sleep(0.5)
+    for item in items:
+        mine = [r for r in receipts if r["idempotency_key"] == item["idempotency_key"]]
+        assert len(mine) == 1  # exactly one outbound delivery per event ever
+
+
+def test_batch_events_queue_behind_existing_head(server):
+    from .conftest import _gates
+    token = f"batch-order-{uuid.uuid4().hex}"
+    _gates[token] = threading.Event()
+
+    head = _post_event(server.base_url, "/t/block", extra_query=f"?token={token}")
+    head_id = head.json()["id"]
+    wait_for(
+        lambda: _get_event(server.base_url, head_id)["status"] == "processing",
+        timeout=10,
+    )
+
+    items = [
+        _batch_item(server.base_url, target_path=f"/t/block?token={token}")
+        for _ in range(2)
+    ]
+    resp = _post_batch(server.base_url, items)
+    assert resp.status_code == 201
+    batch_ids = [e["event"]["id"] for e in resp.json()["events"]]
+    try:
+        time.sleep(0.5)
+        # The blocked head keeps the whole batch queued, in order.
+        for event_id in batch_ids:
+            event = _get_event(server.base_url, event_id)
+            assert event["status"] == "queued"
+            assert event["attempts_count"] == 0
+    finally:
+        httpx.post(f"{server.base_url}/t/release", params={"token": token})
+
+    wait_for(lambda: _get_event(server.base_url, head_id)["status"] == "delivered")
+    for event_id in batch_ids:
+        wait_for(lambda: _get_event(server.base_url, event_id)["status"] == "delivered")
+    times = [
+        _parse_iso(_get_event(server.base_url, eid)["delivered_at"])
+        for eid in [head_id, *batch_ids]
+    ]
+    assert times[0] <= times[1] <= times[2]
