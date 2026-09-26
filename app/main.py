@@ -82,11 +82,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reliable Webhook Delivery API",
-    version="1.3.0",
+    version="1.4.0",
     description="Sign, enqueue, reliably deliver, replay and inspect webhook events, "
     "with persistent per-target circuit breakers.",
     lifespan=lifespan,
 )
+
+# A batch may carry between one and this many events in a single request.
+MAX_BATCH_EVENTS = 100
 
 
 @app.post("/events", status_code=201)
@@ -140,6 +143,135 @@ async def create_event(request: Request) -> JSONResponse:
     if not created:
         response.headers["Idempotent-Replay"] = "true"
     return response
+
+
+@app.post("/events/batch", status_code=200)
+async def create_events_batch(request: Request) -> JSONResponse:
+    """Ingest a batch of 1–100 events in a single signed request.
+
+    The body is a JSON array of the same event objects accepted by
+    ``POST /events``. The ``X-Webhook-Signature`` header is verified against
+    the **entire raw batch body** exactly as for a single event.
+
+    Semantics:
+
+    * A non-array body → ``400``; an array shorter than 1 or longer than
+      100 → ``422``. An idempotency key appearing more than once inside the
+      batch → ``422``; nothing is stored in any of these cases.
+    * Each new event undergoes the same target-URL and delivery-window
+      validation as a single event. If any new event is invalid, the whole
+      request fails with ``422`` and **none** of the batch's new events are
+      stored (a single SQLite transaction; errors carry the offending item's
+      index, e.g. ``loc: [2, "target"]``).
+    * An idempotency key that already exists returns the stored event for
+      that position with ``created=false``; the resubmitted fields (target,
+      payload, window) are ignored and the event is never enqueued again.
+      Resending the same batch is therefore a no-op for those items.
+    * New events are enqueued in array order (rowid order), so the existing
+      per-target head ordering, 1s/2s/4s backoff and circuit-breaker rules
+      schedule them exactly as if they had been posted individually in the
+      same order.
+
+    The response preserves input order; every entry holds the event plus its
+    ``created`` flag.
+    """
+    raw_body = await request.body()
+    signature = request.headers.get(config.SIGNATURE_HEADER)
+    if not _valid_signature(raw_body, signature):
+        raise HTTPException(
+            status_code=401, detail="invalid or missing X-Webhook-Signature"
+        )
+
+    try:
+        data = json.loads(raw_body) if raw_body else None
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="request body must be JSON")
+    if not isinstance(data, list):
+        raise HTTPException(
+            status_code=400, detail="request body must be a JSON array of events"
+        )
+    if not 1 <= len(data) <= MAX_BATCH_EVENTS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"batch must contain between 1 and {MAX_BATCH_EVENTS} events, "
+                f"got {len(data)}"
+            ),
+        )
+
+    # Pydantic validation per item; errors are prefixed with the item index
+    # so callers can tell which element failed.
+    events_in: list[EventIn] = []
+    field_errors: list[dict] = []
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            field_errors.append(
+                {
+                    "type": "dict_type",
+                    "loc": [index],
+                    "msg": "each batch item must be a JSON object",
+                    "input": item,
+                }
+            )
+            continue
+        try:
+            events_in.append(EventIn(**item))
+        except ValidationError as exc:
+            for err in exc.errors():
+                err = dict(err)
+                err["loc"] = [index, *err.get("loc", [])]
+                field_errors.append(err)
+    if field_errors:
+        raise HTTPException(status_code=422, detail=field_errors)
+
+    # Duplicate keys *inside* the batch are a client error; the stored
+    # duplicates are resolved below and reported with created=false.
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for event_in in events_in:
+        if event_in.idempotency_key in seen:
+            duplicates.add(event_in.idempotency_key)
+        seen.add(event_in.idempotency_key)
+    if duplicates:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "idempotency_key must be unique within a batch; duplicated "
+                f"keys: {sorted(duplicates)}"
+            ),
+        )
+
+    try:
+        stored = db.create_events_batch(
+            [
+                (
+                    event_in.idempotency_key,
+                    str(event_in.target),
+                    event_in.payload,
+                    event_in.deliver_after,
+                    event_in.expires_at,
+                )
+                for event_in in events_in
+            ]
+        )
+    except db.InvalidDeliveryWindowError as exc:
+        detail: Any = str(exc)
+        if exc.index is not None:
+            detail = {
+                "index": exc.index,
+                "message": str(exc),
+            }
+        raise HTTPException(status_code=422, detail=detail)
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "results": [
+                {"event": _public_event(event), "created": created}
+                for event, created in stored
+            ]
+        },
+    )
 
 
 @app.get("/events")

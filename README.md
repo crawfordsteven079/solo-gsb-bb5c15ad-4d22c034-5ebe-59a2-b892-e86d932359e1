@@ -2,7 +2,8 @@
 
 一个本地可运行的 Webhook 可靠投递服务：接收带 **目标端点** 和 **幂等键** 的事件，
 校验 HMAC-SHA256 签名后入队，由后台调度器按顺序、带退避重试地向目标端点投递；
-三次重试仍失败则进入死信。支持 **投递时间窗**（`deliver_after` / `expires_at`）：
+三次重试仍失败则进入死信。支持单条提交（`POST /events`）与 **1～100 个事件的批量提交**
+（`POST /events/batch`，整批原子入库、按数组顺序入队、重发不重复投递）。支持 **投递时间窗**（`deliver_after` / `expires_at`）：
 可预约首次投递时刻，也可为排队等待设置截止期限。每个目标端点还带有**自动熔断器**：
 连续 3 次投递失败即熔断 10 秒，到期后仅放行队头事件作为唯一 half-open 探针。
 技术栈：**Python · FastAPI · SQLite**。
@@ -11,6 +12,7 @@
 
 - **HMAC-SHA256 签名校验**：签名针对**原始请求体字节**计算（`X-Webhook-Signature: sha256=<hex>`），密钥来自环境变量 `WEBHOOK_SECRET`，使用恒定时间比较。
 - **幂等接收**：`idempotency_key` 在数据库中有唯一约束。重复提交返回**原事件**（HTTP 200，响应头 `Idempotent-Replay: true`），**不会再次入队或投递**；即使重复请求携带了不同甚至无效的时间窗字段，也一律返回原事件。
+- **批量接收（`POST /events/batch`）**：请求体为 1～100 个事件组成的 JSON 数组，签名仍对**整个原始请求体**计算一次；批内幂等键重复 → `422`。库中已存在的键在对应位置返回原事件并标记 `"created": false`（重提字段一律忽略、不重复投递）；所有新事件在**一个 SQLite 事务**中按数组顺序入队，任一新事件的目标 URL/时间窗校验失败或写入失败都会整体回滚、本批新事件均不入库。响应按输入顺序逐项返回事件与 `created` 标记，**重发同一批不会重复投递**；新事件随后仍由同一调度器按队头顺序、1s/2s/4s 退避与熔断规则调度。
 - **投递时间窗**：创建事件可携带 RFC 3339 的 `deliver_after`（默认创建时刻，提前到该时刻之前不投递）与 `expires_at`（必须晚于 `deliver_after`，否则 422）。调度器每次领取前在同一事务中把已到 `expires_at` 且仍为 `queued` 的事件标记为 `expired`：不产生任何投递尝试，并不再阻塞同目标的后续事件；已进入 `processing` 的事件不因到期而中断。
 - **同一目标端点严格有序**：以创建顺序（SQLite `rowid`）为准，前一条事件未成功、进入死信或过期前，后一条不会被取出投递——即使前一条只是在等待自己的 `deliver_after`。不同端点之间并行投递，互不阻塞。
 - **重试与死信**：首次立即投递（或按 `deliver_after` 延迟）；失败后分别等待 **1s / 2s / 4s** 重试（共 4 次尝试）；第 4 次仍失败（非 2xx、超时、连接错误）即进入死信（状态 `dead`）。
@@ -87,7 +89,52 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
 - 首次创建 → `201`
 - 幂等键重复 → `200`，返回数据库中原事件，带响应头 `Idempotent-Replay: true`，**不会重新投递**；新请求里的时间窗字段被忽略（即使无效也不会 422）
 
-### 2. 查询事件
+### 2. 批量创建事件 `POST /events/batch`
+
+一次提交 1～100 个事件，适合批量导入或批量补发。请求头与单条接口一致，但
+`X-Webhook-Signature` 是对**整个数组原始请求体字节**计算的**同一个 HMAC**（数组内各事件
+不再分别签名）。
+
+请求体为事件对象组成的 **JSON 数组**（每个元素的字段与 `POST /events` 完全相同）：
+
+```json
+[
+  {"idempotency_key": "evt-0001", "target": "http://localhost:8000/dev/sink", "payload": {"n": 1}},
+  {"idempotency_key": "evt-0002", "target": "http://localhost:8000/dev/sink", "payload": {"n": 2}}
+]
+```
+
+规则：
+
+- 签名缺失/错误 → `401`；请求体不是 JSON 数组（如对象/字符串）→ `400`
+- 数组为空或超过 100 项 → `422`
+- **批内幂等键重复**（同一键在数组中出现多次）→ `422`，整批拒绝、不写入任何事件
+- 每个新事件沿用与单条接口完全相同的 `target` URL 校验与时间窗校验（`expires_at` 必须
+  晚于 `deliver_after` 等）；校验错误的 `loc` 以数组下标开头（如 `[2, "target"]`），
+  时间窗错误会在 `detail.index` 标明下标
+- 库中**已存在**的幂等键：在对应位置返回原事件并标记 `"created": false`，重提的
+  target / payload / 时间窗等字段**全部忽略**（即使携带无效时间窗也不会 422），不重复投递
+- 所有**新**事件在**同一个 SQLite 事务**中按数组顺序写入（rowid 顺序即数组顺序）；
+  任一新事件无效或写入失败时事务回滚，**本批新事件均不入库**（已存在的旧事件不受影响）
+
+响应（始终按输入顺序返回，HTTP `200`）：
+
+```json
+{
+  "results": [
+    {"event": {"id": "…", "idempotency_key": "evt-0001", "status": "queued", "…": "…"}, "created": true},
+    {"event": {"id": "…", "idempotency_key": "evt-0002", "status": "queued", "…": "…"}, "created": false}
+  ]
+}
+```
+
+- `created=true`：本次新建并入队；`created=false`：键已存在，返回的是库中原事件
+- **重发同一批**（原样或改动字段）只会得到一串 `created=false` 的原事件，不会产生第二条
+  投递，天然幂等
+- 新事件入队后没有任何特殊调度逻辑：调度器仍按「同目标队头优先」的顺序、1s/2s/4s
+  退避和 per-target 熔断规则投递，批量只改变入队方式，不改变投递语义
+
+### 3. 查询事件
 
 - `GET /events/{event_id}` — 查询单个事件，含全部投递尝试
 - `GET /events/key/{idempotency_key}` — 按幂等键查询
@@ -119,7 +166,7 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
 }
 ```
 
-### 3. 重放死信事件 `POST /events/{event_id}/replay`
+### 4. 重放死信事件 `POST /events/{event_id}/replay`
 
 仅允许 `status=dead` 的事件。服务在同一个事务里把事件重新置为 `queued`
 （`next_attempt_at=now`，首次尝试立即发生），并开启**新一轮完整**的 1s/2s/4s
@@ -140,7 +187,7 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
 并发重复重放由条件更新（`UPDATE … WHERE status='dead'`）保证只有一个请求生效，
 其余返回 `409`，**不会重复入队或重复投递**。
 
-### 4. 查询熔断器 `GET /targets/breakers`
+### 5. 查询熔断器 `GET /targets/breakers`
 
 返回所有有过投递尝试的目标端点的熔断器状态，支持查询参数：
 
@@ -228,6 +275,16 @@ curl -s -X POST "$BASE/events" -H "X-Webhook-Signature: $SIG" -d "$BODY"
 # 查询
 curl -s "$BASE/events/key/$KEY"
 
+# 批量提交 1～100 个事件（签名对整个数组原始请求体计算，只需一次）
+BODY='[
+  {"idempotency_key":"batch-1","target":"'"$BASE"'/dev/sink","payload":{"i":1}},
+  {"idempotency_key":"batch-2","target":"'"$BASE"'/dev/sink","payload":{"i":2}}
+]'
+SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "${WEBHOOK_SECRET:-dev-secret-change-me}" | sed 's/^.* //')"
+curl -s -X POST "$BASE/events/batch" -H "X-Webhook-Signature: $SIG" -d "$BODY"
+# 重发同一批：每个元素仍返回原事件，但 created 全部为 false，不会重复投递
+curl -s -X POST "$BASE/events/batch" -H "X-Webhook-Signature: $SIG" -d "$BODY"
+
 # 演示失败重试 + 死信：让目标前 4 次都返回 500
 BODY2="{\"idempotency_key\":\"${KEY}-fail\",\"target\":\"$BASE/dev/sink?fail_times=4\",\"payload\":{}}"
 SIG2="sha256=$(printf '%s' "$BODY2" | openssl dgst -sha256 -hmac "${WEBHOOK_SECRET:-dev-secret-change-me}" | sed 's/^.* //')"
@@ -305,6 +362,9 @@ python -m pytest tests/ -v
 
 测试启动真实 uvicorn 端口，端到端覆盖：签名校验（缺失/错误/篡改）、成功投递与查询、
 幂等不重复入队、1/2/4 秒退避后死信、失败后恢复、同端点严格有序（含前序失败阻塞后序直到死信）、
+批量提交（整段原始请求体签名、1～100 数量校验、批内重复键 422、按数组顺序入队且顺序投递、
+重发同批 `created=false` 不重复投递、新旧键混合、非法项以下标回报、新事件非法时间窗整批
+回滚不入库、已存在键携带非法时间窗仍返回原事件）、
 死信重放（完整新退避轮次、历史保留与连续编号、replay_count 累计、非死信 409/未知 404、并发重放仅生效一次）、
 投递时间窗（`deliver_after` 延迟投递且未到时的前序事件仍阻塞同目标后续事件、无效时间窗 422、
 幂等键重复返回原事件、queued 到期转 `expired` 零尝试并让位、`processing` 不受到期影响），
@@ -317,7 +377,7 @@ python -m pytest tests/ -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：签名校验、事件接收、查询、死信重放、熔断器查询、dev sink
+│   ├── main.py        # FastAPI 路由：签名校验、事件接收（单条/批量）、查询、死信重放、熔断器查询、dev sink
 │   ├── config.py      # 环境变量配置（含熔断阈值/open 时长）
 │   ├── db.py          # SQLite 表结构、状态机、有序 claim、熔断器状态机、幂等查询
 │   ├── delivery.py    # 出站 HTTP 投递与 HMAC 签名

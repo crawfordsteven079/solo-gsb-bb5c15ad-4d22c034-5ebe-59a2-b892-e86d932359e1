@@ -58,7 +58,16 @@ class ReplayNotAllowedError(Exception):
 
 
 class InvalidDeliveryWindowError(ValueError):
-    """Raised when ``expires_at`` is not strictly later than ``deliver_after``."""
+    """Raised when ``expires_at`` is not strictly later than ``deliver_after``.
+
+    ``index`` identifies the offending item when raised from a batch insert;
+    it is ``None`` for the single-event path.
+    """
+
+    def __init__(self, message: str, index: int | None = None) -> None:
+        self.index = index
+        super().__init__(message)
+
 
 db_lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
@@ -247,6 +256,112 @@ def create_event(
         conn.commit()
         row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
         return dict(row), True
+
+
+def create_events_batch(
+    items: list[tuple[str, str, object, datetime | None, datetime | None]],
+) -> list[tuple[dict, bool]]:
+    """Insert many events in one transaction, in array order.
+
+    Each item is ``(idempotency_key, target, payload, deliver_after,
+    expires_at)``. Returns results in the same order: ``(event, created)``.
+
+    The whole batch is atomic:
+
+    * If a key already exists the stored event is returned for that position
+      with ``created=False``; its other fields are ignored and no second
+      delivery is ever enqueued.
+    * Every genuinely new event is validated with the same delivery-window
+      rule as ``create_event`` and inserted in a *single* SQLite transaction.
+      If any new event has an invalid window, or any insert fails (e.g. a key
+      raced in from another process/request), the transaction is rolled back
+      and the whole batch is retried once; a failure that persists (or an
+      invalid window) rolls everything back, so none of the batch's new
+      events are stored while the pre-existing events are left untouched.
+
+    The caller is expected to have rejected idempotency keys duplicated
+    *within* the batch already; seeing one here is a programming error.
+    """
+    if len({item[0] for item in items}) != len(items):
+        raise ValueError("duplicate idempotency key inside batch")
+
+    with db_lock:
+        conn = get_conn()
+        for _attempt in range(2):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                now_dt = datetime.now(timezone.utc)
+                results: list[tuple[dict, bool]] = []
+                to_insert: list[tuple] = []
+
+                keys = [item[0] for item in items]
+                placeholders = ",".join("?" for _ in keys)
+                existing_rows = conn.execute(
+                    f"SELECT * FROM events WHERE idempotency_key IN ({placeholders})",
+                    keys,
+                ).fetchall()
+                existing = {row["idempotency_key"]: dict(row) for row in existing_rows}
+
+                for index, (key, target, payload, deliver_after, expires_at) in enumerate(
+                    items
+                ):
+                    if key in existing:
+                        results.append((existing[key], False))
+                        continue
+                    deliver_after = deliver_after or now_dt
+                    if expires_at is not None and expires_at <= deliver_after:
+                        raise InvalidDeliveryWindowError(
+                            "expires_at must be later than deliver_after "
+                            f"(item {index}: deliver_after={_iso_utc(deliver_after)}, "
+                            f"expires_at={_iso_utc(expires_at)})",
+                            index=index,
+                        )
+                    event_id = uuid.uuid4().hex
+                    payload_json = json.dumps(
+                        payload, separators=(",", ":"), ensure_ascii=False
+                    )
+                    to_insert.append(
+                        (
+                            event_id,
+                            key,
+                            target,
+                            payload_json,
+                            _iso_utc(now_dt),
+                            deliver_after.timestamp(),
+                            _iso_utc(deliver_after),
+                            _iso_utc(expires_at) if expires_at is not None else None,
+                            expires_at.timestamp() if expires_at is not None else None,
+                        )
+                    )
+                    results.append(({"id": event_id}, True))
+
+                if to_insert:
+                    conn.executemany(
+                        "INSERT INTO events "
+                        "(id, idempotency_key, target, payload, status, attempts_count, "
+                        " created_at, next_attempt_at, deliver_after, expires_at, "
+                        " expires_at_ts) "
+                        "VALUES (?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)",
+                        to_insert,
+                    )
+                conn.commit()
+                break
+            except InvalidDeliveryWindowError:
+                conn.rollback()
+                raise
+            except sqlite3.Error:
+                # Most likely a unique-key race with another process between
+                # the SELECT and the INSERT: roll back and re-read once.
+                conn.rollback()
+                if _attempt == 1:
+                    raise
+
+        # Stable, per-item hydration (attempts list included) for both the
+        # newly inserted and the pre-existing events.
+        return [
+            (get_event(event["id"]), created)
+            for event, created in results
+        ]
 
 
 def _hydrate(row: sqlite3.Row) -> dict:
