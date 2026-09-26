@@ -1,0 +1,27 @@
+services:
+  webhook:
+    build: .
+    image: reliable-webhook:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # Override this with a strong secret in real use, e.g. via .env:
+      #   echo "WEBHOOK_SECRET=$(openssl rand -hex 32)" > .env
+      WEBHOOK_SECRET: "${WEBHOOK_SECRET:-dev-secret-change-me}"
+      WEBHOOK_DB_PATH: "/data/webhooks.db"
+      WORKER_POLL_INTERVAL: "0.2"
+      DELIVERY_TIMEOUT: "10"
+      # Per-target circuit breaker: 3 consecutive failures open it for 10s.
+      BREAKER_FAILURE_THRESHOLD: "${BREAKER_FAILURE_THRESHOLD:-3}"
+      BREAKER_OPEN_SECONDS: "${BREAKER_OPEN_SECONDS:-10}"
+    volumes:
+      # Persists events, delivery attempts, dead-letter/replay state and
+      # per-target breaker state (state, failure count, open deadline).
+      # Older databases are migrated in place on startup — the replay and
+      # delivery-window columns and the breakers table are added
+      # automatically.
+      - webhook-data:/data
+    restart: unless-stopped
+
+volumes:
+  webhook-data:
